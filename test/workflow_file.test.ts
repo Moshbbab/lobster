@@ -226,10 +226,8 @@ test('workflow input resumes preserve the full subject even when the tool envelo
       },
       {
         id: 'finish',
-        run: 'node -e "process.stdout.write(JSON.stringify({subjectLength:String(process.env.SUBJECT ?? \'\').length}))"',
-        env: {
-          SUBJECT: '$review.subject.text',
-        },
+        run: 'node -e "let data=\'\'; process.stdin.setEncoding(\'utf8\'); process.stdin.on(\'data\', (chunk) => data += chunk); process.stdin.on(\'end\', () => process.stdout.write(JSON.stringify({subjectLength:data.length})))"',
+        stdin: '$review.subject.text',
       },
     ],
   };
