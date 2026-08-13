@@ -280,7 +280,8 @@ export function createLlmInvokeCommand(config: CommandConfig): LobsterCommand {
 					"schema-version": { type: "string", description: "Logical schema version for caching" },
 					"max-validation-retries": {
 						type: "number",
-						description: "Retries when schema validation fails",
+						description:
+							"Extra model calls allowed after the first when schema validation fails (default 1)",
 					},
 					temperature: { type: "number", description: "Sampling temperature" },
 					"max-output-tokens": { type: "number", description: "Max completion tokens" },
@@ -306,7 +307,8 @@ export function createLlmInvokeCommand(config: CommandConfig): LobsterCommand {
 				"Features:",
 				"  - Typed payload validation before invoking the adapter.",
 				"  - Run-state + file cache so resumes do not re-call the LLM.",
-				"  - Optional JSON-schema enforcement with bounded retries.",
+				"  - Optional JSON-schema enforcement, retried at most --max-validation-retries times",
+				"    after the first call.",
 				"",
 				"Config:",
 				...config.helpConfig.map((line) => `  - ${line}`),
@@ -503,7 +505,7 @@ async function runLlmInvoke({
 		}
 
 		lastValidationErrors = collectAjvErrors(validator.errors);
-		if (attempt > maxValidationRetries + 1) {
+		if (attempt > maxValidationRetries) {
 			throw new Error(
 				`${config.name} output failed schema validation: ${lastValidationErrors.join("; ")}`,
 			);
