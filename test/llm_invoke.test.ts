@@ -422,6 +422,380 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
 	}
 });
 
+test(
+	"llm.invoke aborts the in-flight adapter request when ctx.signal aborts",
+	{ timeout: 20_000 },
+	async () => {
+		const registry = createDefaultRegistry();
+		const cmd = registry.get("llm.invoke");
+		assert.ok(cmd);
+
+		const stalled = createStalledAdapter();
+		await stalled.listen();
+
+		const controller = new AbortController();
+		try {
+			const pending = cmd.run({
+				input: streamOf([]),
+				args: { _: [], provider: "http", prompt: "Summarize", "disable-cache": true },
+				ctx: {
+					...baseCtx(
+						{ LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${stalled.port}/invoke` },
+						registry,
+					),
+					signal: controller.signal,
+				},
+			} as any);
+
+			await stalled.requestReceived;
+			controller.abort();
+
+			const err = await pending.then(
+				() => null,
+				(e: any) => e,
+			);
+			assert.ok(err, "llm.invoke should reject once the run is aborted");
+			assert.ok(
+				err.name === "AbortError" || err.code === "ABORT_ERR",
+				`expected an abort error, got ${err.name}: ${err.message}`,
+			);
+			// The abort must stay recognizable; wrapping it hides the cancellation from
+			// workflow timeout and abort handling.
+			assert.doesNotMatch(String(err.message), /request failed/);
+			await stalled.requestClosed;
+		} finally {
+			controller.abort();
+			await stalled.close();
+		}
+	},
+);
+
+test(
+	"llm.invoke stops waiting for a direct adapter that ignores ctx.signal",
+	{ timeout: 20_000 },
+	async () => {
+		const registry = createDefaultRegistry();
+		const cmd = registry.get("llm.invoke");
+		assert.ok(cmd);
+
+		let invoked = () => {};
+		const adapterInvoked = new Promise<void>((resolve) => (invoked = resolve));
+		// A supported ctx.llmAdapters adapter that never resolves and never looks
+		// at ctx.signal.
+		const stubborn = {
+			invoke() {
+				invoked();
+				return new Promise<never>(() => {});
+			},
+		};
+
+		const controller = new AbortController();
+		const pending = cmd.run({
+			input: streamOf([]),
+			args: { _: [], provider: "stubborn", prompt: "Summarize", "disable-cache": true },
+			ctx: {
+				...baseCtx({}, registry),
+				llmAdapters: { stubborn },
+				signal: controller.signal,
+			},
+		} as any);
+
+		await adapterInvoked;
+		controller.abort();
+
+		const err = await pending.then(
+			() => null,
+			(e: any) => e,
+		);
+		assert.ok(err, "llm.invoke should reject once the run is aborted");
+		assert.ok(
+			err.name === "AbortError" || err.code === "ABORT_ERR",
+			`expected an abort error, got ${err.name}: ${err.message}`,
+		);
+		assert.doesNotMatch(String(err.message), /request failed/);
+	},
+);
+
+test("llm.invoke observes a direct adapter that rejects after aborting the run", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke");
+	assert.ok(cmd);
+
+	const controller = new AbortController();
+	// An adapter that cancels the run from inside its own invoke and then fails:
+	// the shape of an SDK client that tears itself down on a fatal error.
+	const selfaborting = {
+		invoke() {
+			controller.abort();
+			return Promise.reject(new Error("adapter tore down its client"));
+		},
+	};
+
+	const unhandled: any[] = [];
+	const onUnhandled = (reason: any) => unhandled.push(reason);
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const err = await cmd
+			.run({
+				input: streamOf([]),
+				args: { _: [], provider: "selfaborting", prompt: "Summarize", "disable-cache": true },
+				ctx: {
+					...baseCtx({}, registry),
+					llmAdapters: { selfaborting },
+					signal: controller.signal,
+				},
+			} as any)
+			.then(
+				() => null,
+				(e: any) => e,
+			);
+		assert.ok(
+			err?.name === "AbortError" || err?.code === "ABORT_ERR",
+			`expected an abort error, got ${err?.name}: ${err?.message}`,
+		);
+		// The adapter's own rejection must not outlive the cancelled step. Nothing is
+		// waiting on it once the abort has won the race, and an unobserved rejection
+		// ends the process under Node's default handling.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(
+			unhandled.length,
+			0,
+			`adapter rejection went unhandled: ${unhandled[0]?.message ?? unhandled[0]}`,
+		);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+	}
+});
+
+test("llm.invoke does not complete from cache when ctx.signal is already aborted", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke");
+	assert.ok(cmd);
+	const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+	await mkdir(path.join(cacheDir, "llm.invoke"), { recursive: true });
+
+	let requests = 0;
+	const server = http.createServer((req, res) => {
+		requests += 1;
+		req.resume();
+		req.on("end", () => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					ok: true,
+					result: { runId: "cached_1", output: { text: "hello", data: null } },
+				}),
+			);
+		});
+	});
+
+	await new Promise<void>((resolve) => server.listen(0, resolve));
+	const addr = server.address();
+	const port = typeof addr === "object" && addr ? addr.port : 0;
+	const env = {
+		LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}/invoke`,
+		LOBSTER_CACHE_DIR: cacheDir,
+	};
+	const args = { _: [], provider: "http", prompt: "Summarize" };
+
+	try {
+		// Populate the cache, then repeat the same call on a cancelled run.
+		const warm = await cmd.run({
+			input: streamOf([]),
+			args,
+			ctx: baseCtx(env, registry),
+		} as any);
+		assert.equal((await collect(warm.output!))[0].cached, false);
+		assert.equal(requests, 1);
+
+		const controller = new AbortController();
+		controller.abort();
+		await assert.rejects(
+			() =>
+				cmd.run({
+					input: streamOf([]),
+					args,
+					ctx: { ...baseCtx(env, registry), signal: controller.signal },
+				} as any),
+			(err: any) => err?.name === "AbortError" || err?.code === "ABORT_ERR",
+		);
+		assert.equal(requests, 1, "the cached run must not reach the adapter either");
+	} finally {
+		await rm(cacheDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("llm.invoke does not replay a cache hit when ctx.signal aborts while input is drained", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke");
+	assert.ok(cmd);
+	const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+	await mkdir(path.join(cacheDir, "llm.invoke"), { recursive: true });
+
+	let requests = 0;
+	const server = http.createServer((req, res) => {
+		requests += 1;
+		req.resume();
+		req.on("end", () => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					ok: true,
+					result: { runId: "cached_1", output: { text: "hello", data: null } },
+				}),
+			);
+		});
+	});
+
+	await new Promise<void>((resolve) => server.listen(0, resolve));
+	const addr = server.address();
+	const port = typeof addr === "object" && addr ? addr.port : 0;
+	const env = {
+		LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}/invoke`,
+		LOBSTER_CACHE_DIR: cacheDir,
+	};
+	const args = { _: [], provider: "http", prompt: "Summarize" };
+
+	try {
+		const warm = await cmd.run({
+			input: streamOf([]),
+			args,
+			ctx: baseCtx(env, registry),
+		} as any);
+		assert.equal((await collect(warm.output!))[0].cached, false);
+		assert.equal(requests, 1);
+
+		// The step timeout fires while the upstream step is still producing input,
+		// which is after the entry check and before the cache lookup.
+		const controller = new AbortController();
+		const abortingInput = (async function* () {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			controller.abort();
+		})();
+
+		await assert.rejects(
+			() =>
+				cmd.run({
+					input: abortingInput,
+					args,
+					ctx: { ...baseCtx(env, registry), signal: controller.signal },
+				} as any),
+			(err: any) => err?.name === "AbortError" || err?.code === "ABORT_ERR",
+		);
+		assert.equal(requests, 1, "a cancelled run must not reach the adapter either");
+	} finally {
+		await rm(cacheDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("llm.invoke does not replay run state when ctx.signal aborts while input is drained", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke");
+	assert.ok(cmd);
+	const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+
+	let requests = 0;
+	const server = http.createServer((req, res) => {
+		requests += 1;
+		req.resume();
+		req.on("end", () => {
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					ok: true,
+					result: { runId: "state_1", output: { text: "hello", data: null } },
+				}),
+			);
+		});
+	});
+
+	await new Promise<void>((resolve) => server.listen(0, resolve));
+	const addr = server.address();
+	const port = typeof addr === "object" && addr ? addr.port : 0;
+	const env = {
+		LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}/invoke`,
+		LOBSTER_STATE_DIR: stateDir,
+	};
+	const args = {
+		_: [],
+		provider: "http",
+		prompt: "Summarize",
+		"state-key": "step-1",
+		"disable-cache": true,
+	};
+
+	try {
+		const warm = await cmd.run({
+			input: streamOf([]),
+			args,
+			ctx: baseCtx(env, registry),
+		} as any);
+		assert.equal((await collect(warm.output!))[0].cached, false);
+		assert.equal(requests, 1);
+
+		const controller = new AbortController();
+		const abortingInput = (async function* () {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			controller.abort();
+		})();
+
+		await assert.rejects(
+			() =>
+				cmd.run({
+					input: abortingInput,
+					args,
+					ctx: { ...baseCtx(env, registry), signal: controller.signal },
+				} as any),
+			(err: any) => err?.name === "AbortError" || err?.code === "ABORT_ERR",
+		);
+		assert.equal(requests, 1, "a cancelled run must not reach the adapter either");
+	} finally {
+		await rm(stateDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("llm.invoke does not call the adapter when ctx.signal is already aborted", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke");
+	assert.ok(cmd);
+
+	let requests = 0;
+	const server = http.createServer((req, res) => {
+		requests += 1;
+		req.resume();
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(JSON.stringify({ ok: true, result: { runId: "r1", output: { data: {} } } }));
+	});
+
+	await new Promise<void>((resolve) => server.listen(0, resolve));
+	const addr = server.address();
+	const port = typeof addr === "object" && addr ? addr.port : 0;
+
+	try {
+		const controller = new AbortController();
+		controller.abort();
+
+		await assert.rejects(
+			() =>
+				cmd.run({
+					input: streamOf([]),
+					args: { _: [], provider: "http", prompt: "Summarize", "disable-cache": true },
+					ctx: {
+						...baseCtx({ LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}/invoke` }, registry),
+						signal: controller.signal,
+					},
+				} as any),
+			(err: any) => err?.name === "AbortError" || err?.code === "ABORT_ERR",
+		);
+		assert.equal(requests, 0, "an already-cancelled run must not reach the adapter");
+	} finally {
+		await closeServer(server);
+	}
+});
+
 test("llm.invoke does not retry schema validation after adapter cancellation", async () => {
 	const registry = createDefaultRegistry();
 	const cmd = registry.get("llm.invoke");
@@ -875,6 +1249,44 @@ function baseCtx(envOverrides: Record<string, string>, registry?: any) {
 		registry: registry ?? null,
 		mode: "tool",
 		render: { json() {}, lines() {} },
+	};
+}
+
+// An adapter that accepts the request and never answers, so the only thing that
+// can end the call is the caller cancelling it.
+function createStalledAdapter() {
+	const sockets = new Set<import("node:net").Socket>();
+	let markReceived = () => {};
+	let markClosed = () => {};
+	const requestReceived = new Promise<void>((resolve) => (markReceived = resolve));
+	const requestClosed = new Promise<void>((resolve) => (markClosed = resolve));
+
+	const server = http.createServer((req, res) => {
+		req.resume();
+		req.on("end", () => {
+			res.on("close", () => markClosed());
+			markReceived();
+		});
+	});
+	server.on("connection", (socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+	});
+
+	return {
+		requestReceived,
+		requestClosed,
+		port: 0,
+		async listen() {
+			await new Promise<void>((resolve) => server.listen(0, resolve));
+			const addr = server.address();
+			this.port = typeof addr === "object" && addr ? addr.port : 0;
+		},
+		async close() {
+			for (const socket of sockets) socket.destroy();
+			if (!server.listening) return;
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		},
 	};
 }
 

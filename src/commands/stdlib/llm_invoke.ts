@@ -739,6 +739,10 @@ async function runLlmInvoke({
 	config: CommandConfig;
 }) {
 	const env = ctx.env ?? process.env;
+	const signal: AbortSignal | undefined = ctx?.signal;
+	// Run-state and cache hits return before any adapter call, so a cancelled run
+	// would otherwise still finish as a success.
+	throwIfCancelled(signal);
 	const provider = resolveProvider(args, env, config.defaultProvider, ctx);
 	const adapter = resolveAdapter({ provider, env, args, config, ctx });
 	const prompt = extractPrompt(args);
@@ -785,6 +789,9 @@ async function runLlmInvoke({
 
 	const inputArtifacts: any[] = [];
 	for await (const item of input) inputArtifacts.push(item);
+	// Draining pipeline input waits on the upstream step, so a timeout can fire
+	// here. Re-check before the reuse lookups below can answer with a success.
+	throwIfCancelled(signal);
 
 	const normalizedArtifacts = [...inputArtifacts, ...providedArtifacts].map(normalizeArtifact);
 	const artifactHashes = normalizedArtifacts.map(hashArtifact);
@@ -801,6 +808,9 @@ async function runLlmInvoke({
 
 	if (stateKey && !forceRefresh) {
 		const stored = await readReusableLlmState(env, stateKey, ctx.signal);
+		// Reading run state is I/O of unbounded duration; a signal that aborted
+		// during it must not be overtaken by the replay below.
+		throwIfCancelled(signal);
 		const reused = pickReusableState(stored, cacheKey, config.stateType);
 		if (reused) {
 			const replay: LlmProvenance = { cacheKey, replayed: true };
@@ -816,6 +826,7 @@ async function runLlmInvoke({
 
 	if (!disableCache && !forceRefresh) {
 		const cache = await readCacheEntry(env, cacheKey, config.cacheNamespace, ctx.signal);
+		throwIfCancelled(signal);
 		if (cache) {
 			const replay: LlmProvenance = { cacheKey, replayed: true };
 			return {
@@ -849,6 +860,7 @@ async function runLlmInvoke({
 	let lastValidationErrors: string[] = [];
 
 	while (true) {
+		throwIfCancelled(signal);
 		attempt += 1;
 		if (attempt > 1) {
 			payload.retryContext = {
@@ -862,9 +874,16 @@ async function runLlmInvoke({
 		let responseEnvelope: LlmResponseEnvelope;
 		try {
 			ctx.signal?.throwIfAborted();
-			responseEnvelope = await adapter.invoke({ env, args, payload, signal: ctx.signal });
+			responseEnvelope = await abortable(
+				adapter.invoke({ env, args, payload, signal: ctx.signal }),
+				signal,
+			);
 			ctx.signal?.throwIfAborted();
 		} catch (err: any) {
+			// Cancellation is the caller's error, not an adapter failure: surface it
+			// as an abort so workflow timeout and abort handling still recognizes it,
+			// rather than wrapping it in a "request failed" adapter error.
+			if (signal?.aborted) throw asCancellation(err, signal);
 			throw new Error(`${config.name} request failed: ${err?.message ?? String(err)}`);
 		}
 
@@ -938,6 +957,66 @@ async function runLlmInvoke({
 	}
 }
 
+/**
+ * Build the error a cancelled run rejects with.
+ *
+ * The workflow runner only treats an error named `AbortError` or coded
+ * `ABORT_ERR` as cancellation; everything else follows the step's retry and
+ * `on_error` policy. A host may abort with any reason it likes, so passing
+ * `signal.reason` straight through means `controller.abort(new Error("stop"))`
+ * leaves a cancelled step looking like an ordinary failure -- retried, or
+ * swallowed by `on_error: continue` and reported as a successful run. Keep the
+ * host's message and hang its reason off `cause`, but mark the rejection so the
+ * runner recognizes it.
+ */
+function cancellationError(signal: AbortSignal): unknown {
+	const reason: any = signal.reason;
+	if (reason === undefined || reason === null) {
+		return new DOMException("The operation was aborted.", "AbortError");
+	}
+	if (reason?.name === "AbortError" || reason?.code === "ABORT_ERR") return reason;
+	const message =
+		typeof reason?.message === "string" && reason.message ? reason.message : String(reason);
+	const error: any = new Error(message, { cause: reason });
+	error.name = "AbortError";
+	error.code = "ABORT_ERR";
+	return error;
+}
+
+/** Rethrow `err` when it already reads as cancellation, else the run's reason. */
+function asCancellation(err: any, signal: AbortSignal): unknown {
+	if (err?.name === "AbortError" || err?.code === "ABORT_ERR") return err;
+	return cancellationError(signal);
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+	if (signal?.aborted) throw cancellationError(signal);
+}
+
+/**
+ * Reject as soon as the run is cancelled instead of waiting for `promise`.
+ * HTTP adapters are cancelled at the socket, but an injected `ctx.llmAdapters`
+ * adapter may ignore `ctx.signal` entirely; without this, one of those keeps a
+ * timed-out step waiting for as long as it likes.
+ */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(cancellationError(signal));
+		// Observe `promise` before anything can settle the wrapper, including the
+		// already-aborted case below. An adapter can cancel the run from inside its own
+		// `invoke` and reject afterwards; rejecting here without watching that promise
+		// leaves the rejection unhandled, which ends the process under Node's default
+		// handling -- long after this step was cancelled cleanly.
+		promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 function resolveProvider(
 	args: any,
 	env: any,
@@ -983,6 +1062,7 @@ function resolveAdapter({
 	config: CommandConfig;
 	ctx: any;
 }): Adapter {
+	const signal: AbortSignal | undefined = ctx?.signal;
 	const direct = getDirectAdapter(ctx, provider);
 	if (direct) {
 		const invoke = typeof direct === "function" ? direct : direct.invoke;
