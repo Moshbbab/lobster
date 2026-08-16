@@ -3343,7 +3343,7 @@ test("process-tree escalation survives a short-lived caller", async () => {
 	}
 });
 
-test("an in-flight gog.gmail.send completes and halts the pipeline after cancellation", async () => {
+test("an in-flight gog.gmail.send is terminated and the pipeline halts after cancellation", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-cancel-send-"));
 	try {
 		const repoRoot = join(__dirname, "..", "..");
@@ -3387,28 +3387,29 @@ test("an in-flight gog.gmail.send completes and halts the pipeline after cancell
 					MOCK_GOG_SEND_TERMINATED_FILE: sendTerminated,
 					MOCK_GOG_SEND_COMPLETED_FILE: sendCompleted,
 					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
-					MOCK_GOG_COMPLETION_DELAY_MS: "100",
+					MOCK_GOG_TERMINATION_DELAY_MS: "1000",
+					MOCK_GOG_COMPLETION_DELAY_MS: "5000",
 				},
 			},
 		});
 
 		await waitForFile(sendStarted);
+		const childPid = Number(await readFile(sendStarted, "utf8"));
 		controller.abort();
 		const immediate = await observeSettlement(run, 50);
 		const envelope = await run;
 
-		assert.equal(
-			immediate.settled,
-			false,
-			"an already-started send must not report an ambiguous abort",
-		);
+		assert.equal(immediate.settled, false, "workflow must wait for the send child to exit");
 		assertCancellationEnvelope(envelope);
 		assert.equal(downstreamStarted, false, "cancellation must stop later pipeline stages");
-		await waitForFile(sendCompleted, 500);
+		if (process.platform !== "win32") {
+			await waitForFile(sendTerminated, 500);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 700));
+		assert.equal(processIsRunning(childPid), false);
 		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1, "cancellation must prevent the second send from starting");
-		assert.equal(await fileExists(sendTerminated), false);
-		assert.equal(await fileExists(sendCompleted), true);
+		assert.equal(await fileExists(sendCompleted), false, "a cancelled send must not finish");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -3492,7 +3493,7 @@ test("cancellation after a Gmail send interrupts a blocked next draft read", asy
 	}
 });
 
-test("workflow pipeline halts after an in-flight send completes under cancellation", async () => {
+test("workflow pipeline terminates an in-flight send and halts under cancellation", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-workflow-cancel-send-"));
 	try {
 		const repoRoot = join(__dirname, "..", "..");
@@ -3554,34 +3555,36 @@ test("workflow pipeline halts after an in-flight send completes under cancellati
 					MOCK_GOG_SEND_TERMINATED_FILE: sendTerminated,
 					MOCK_GOG_SEND_COMPLETED_FILE: sendCompleted,
 					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
-					MOCK_GOG_COMPLETION_DELAY_MS: "100",
+					MOCK_GOG_TERMINATION_DELAY_MS: "1000",
+					MOCK_GOG_COMPLETION_DELAY_MS: "5000",
 				},
 			},
 		});
 
 		await waitForFile(sendStarted);
+		const childPid = Number(await readFile(sendStarted, "utf8"));
 		controller.abort();
 		const immediate = await observeSettlement(run, 50);
 		const envelope = await run;
 
-		assert.equal(
-			immediate.settled,
-			false,
-			"an already-started workflow send must return a definitive result",
-		);
+		assert.equal(immediate.settled, false, "workflow must wait for the send child to exit");
 		assertCancellationEnvelope(envelope);
-		await waitForFile(sendCompleted, 500);
+		if (process.platform !== "win32") {
+			await waitForFile(sendTerminated, 500);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 700));
+		assert.equal(processIsRunning(childPid), false);
 		assert.equal(nestedStarted, false, "cancellation must stop the next nested pipeline stage");
 		assert.equal(laterStarted, false, "cancellation must stop later workflow steps");
 		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1);
-		assert.equal(await fileExists(sendTerminated), false);
+		assert.equal(await fileExists(sendCompleted), false, "a cancelled send must not finish");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
 });
 
-test("parallel timeout waits for in-flight sends before retrying", async () => {
+test("parallel timeout kills in-flight sends without retrying", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-parallel-timeout-send-settlement-"));
 	try {
 		const repoRoot = join(__dirname, "..", "..");
@@ -3640,11 +3643,133 @@ test("parallel timeout waits for in-flight sends before retrying", async () => {
 		assert.match(result.error?.message ?? "", /timed out|timeout|abort|cancel/i);
 		assert.equal(
 			await fileExists(sendCompleted),
-			true,
-			"a timeout must wait for its in-flight send before retry policy returns",
+			false,
+			"a timeout must kill its in-flight send before retry policy returns",
 		);
 		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
-		assert.equal(invocations.length, 2);
+		assert.equal(
+			invocations.length,
+			1,
+			"a timed-out send must not retry; Gmail may already have accepted the first message",
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a templated Gmail send pipeline is not retried after timeout", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-templated-send-retry-"));
+	try {
+		const repoRoot = join(__dirname, "..", "..");
+		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
+		const filePath = join(dir, "workflow.lobster");
+		const sendStarted = join(dir, "send-started");
+		const sendInvocations = join(dir, "send-invocations");
+		await writeFile(
+			filePath,
+			JSON.stringify({
+				args: { send_pipeline: { default: "gog.gmail.send" } },
+				steps: [
+					{
+						id: "draft",
+						run: `${JSON.stringify(process.execPath)} -e "process.stdout.write(JSON.stringify({to:'user@example.com',subject:'Hello',body:'World'}))"`,
+					},
+					{
+						id: "send",
+						pipeline: "${send_pipeline}",
+						stdin: "$draft.json",
+						timeout_ms: 80,
+						retry: { max: 2, delay_ms: 0 },
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const run = runToolRequest({
+			filePath,
+			ctx: {
+				cwd: dir,
+				registry: createDefaultRegistry(),
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					GOG_BIN: mockGog,
+					MOCK_GOG_SEND_STARTED_FILE: sendStarted,
+					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
+					MOCK_GOG_COMPLETION_DELAY_MS: "300",
+				},
+			},
+		});
+
+		await waitForFile(sendStarted);
+		const result = await run;
+		assert.equal(result.ok, false);
+		assert.match(result.error?.message ?? "", /timed out|timeout|abort|cancel/i);
+		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
+		assert.equal(invocations.length, 1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a parent does not retry a child workflow after the child sends Gmail", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-composed-send-retry-"));
+	try {
+		const repoRoot = join(__dirname, "..", "..");
+		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
+		const childPath = join(dir, "child.lobster");
+		const parentPath = join(dir, "parent.lobster");
+		const sendStarted = join(dir, "send-started");
+		const sendInvocations = join(dir, "send-invocations");
+		await writeFile(
+			childPath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "draft",
+						run: `${JSON.stringify(process.execPath)} -e "process.stdout.write(JSON.stringify({to:'user@example.com',subject:'Hello',body:'World'}))"`,
+					},
+					{ id: "send", pipeline: "gog.gmail.send", stdin: "$draft.json" },
+					{ id: "fail", run: `${JSON.stringify(process.execPath)} -e "process.exit(1)"` },
+				],
+			}),
+			"utf8",
+		);
+		await writeFile(
+			parentPath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "child",
+						workflow: "./child.lobster",
+						retry: { max: 2, delay_ms: 0 },
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		const result = await runToolRequest({
+			filePath: parentPath,
+			ctx: {
+				cwd: dir,
+				registry: createDefaultRegistry(),
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					GOG_BIN: mockGog,
+					MOCK_GOG_SEND_STARTED_FILE: sendStarted,
+					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
+					MOCK_GOG_COMPLETION_DELAY_MS: "50",
+				},
+			},
+		});
+
+		assert.equal(result.ok, false);
+		assert.match(result.error?.message ?? "", /workflow command failed/);
+		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
+		assert.equal(invocations.length, 1);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
