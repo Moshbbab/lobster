@@ -28,6 +28,22 @@ function streamOf(items) {
 	})();
 }
 
+test("state key boundary trimming preserves normalized filenames", () => {
+	const tmp = path.join(os.tmpdir(), "lobster-state");
+
+	for (const [key, filename] of [
+		["_Demo KEY_", "demo_key.json"],
+		["___Demo KEY___", "demo_key.json"],
+		[" Demo KEY ", "demo_key.json"],
+		["-Demo KEY-", "-demo_key-.json"],
+		[".Demo KEY.", ".demo_key..json"],
+	]) {
+		assert.equal(keyToPath(tmp, key), path.join(tmp, filename));
+	}
+	assert.throws(() => keyToPath(tmp, "_"), /state key is empty\/invalid/);
+	assert.throws(() => keyToPath(tmp, "___"), /state key is empty\/invalid/);
+});
+
 test("state.set writes and state.get reads", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-state-"));
 	const registry = createDefaultRegistry();
