@@ -196,6 +196,13 @@ type RunContext = {
 
 const NON_RETRYABLE_STEP_ERROR = Symbol("lobster.nonRetryableStepError");
 
+function createRecord<T>(source?: Record<string, T>): Record<string, T> {
+	const record = Object.create(null) as Record<string, T>;
+	if (!source) return record;
+	for (const [key, value] of Object.entries(source)) record[key] = value;
+	return record;
+}
+
 function markStepErrorNonRetryable(error: unknown): Error {
 	const normalized = error instanceof Error ? error : new Error(String(error));
 	Object.defineProperty(normalized, NON_RETRYABLE_STEP_ERROR, { value: true });
@@ -731,7 +738,7 @@ export function resolveWorkflowArgs(
 	argDefs: WorkflowFile["args"],
 	provided: Record<string, unknown> | undefined,
 ) {
-	const resolved: Record<string, unknown> = {};
+	const resolved = createRecord<unknown>();
 	if (argDefs) {
 		for (const [key, def] of Object.entries(argDefs)) {
 			if (def && typeof def === "object" && "default" in def) {
@@ -884,7 +891,7 @@ export async function runWorkflowFile({
 		const stepIndexById = new Map(steps.map((step, idx) => [step.id, idx]));
 		const results: Record<string, WorkflowStepResult> = resumeState?.steps
 			? cloneResults(resumeState.steps)
-			: {};
+			: createRecord();
 		const startIndex = resumeState?.resumeAtIndex ?? 0;
 
 		if (resumeState?.approvalStepId && typeof approved === "boolean") {
@@ -1141,7 +1148,7 @@ export async function runWorkflowFile({
 					}
 
 					const item = itemsRef[itemIdx];
-					const scopedResults: Record<string, WorkflowStepResult> = { ...results };
+					const scopedResults = createRecord(results);
 					scopedResults[itemVar] = {
 						id: itemVar,
 						json: item,
@@ -1223,7 +1230,9 @@ export async function runWorkflowFile({
 						}
 					}
 
-					const iterResult: Record<string, unknown> = { [itemVar]: item, [indexVar]: itemIdx };
+					const iterResult = createRecord<unknown>();
+					iterResult[itemVar] = item;
+					iterResult[indexVar] = itemIdx;
 					for (const subStep of step.steps) {
 						const subResult = scopedResults[subStep.id];
 						if (subResult && !subResult.skipped) {
@@ -1231,7 +1240,7 @@ export async function runWorkflowFile({
 								subResult.json !== undefined ? subResult.json : subResult.stdout;
 						}
 					}
-					iterationResults.push(iterResult);
+					iterationResults.push(Object.fromEntries(Object.entries(iterResult)));
 				}
 
 				const loopResult: WorkflowStepResult = {
@@ -1412,7 +1421,8 @@ export async function runWorkflowFile({
 									branchId: string;
 									result: WorkflowStepResult;
 								};
-								parallelBranchResults = { [winner.branchId]: winner.result };
+								parallelBranchResults = createRecord();
+								parallelBranchResults[winner.branchId] = winner.result;
 								branchLedgers.get(winner.branchId)?.release();
 							} else {
 								const settled = (await (timeoutPromise
@@ -1422,7 +1432,7 @@ export async function runWorkflowFile({
 									result: WorkflowStepResult;
 								}>[];
 
-								parallelBranchResults = {};
+								parallelBranchResults = createRecord();
 								for (const entry of settled) {
 									if (entry.status === "rejected") {
 										throw new Error(
@@ -1440,10 +1450,12 @@ export async function runWorkflowFile({
 							else await branchesSettled;
 						}
 
-						const merged: Record<string, unknown> = {};
-						for (const [branchId, branchResult] of Object.entries(parallelBranchResults ?? {})) {
-							merged[branchId] = branchResult.json;
-						}
+						const merged = Object.fromEntries(
+							Object.entries(parallelBranchResults ?? {}).map(([branchId, branchResult]) => [
+								branchId,
+								branchResult.json,
+							]),
+						);
 						result = {
 							id: step.id,
 							json: merged,
@@ -2017,7 +2029,7 @@ function dryRunWorkflow({
 			if (step.pause_ms) lines.push(`     pause_ms: ${step.pause_ms}`);
 			lines.push(`     sub-steps: ${step.steps.length}`);
 
-			const loopScopedResults = { ...results };
+			const loopScopedResults = createRecord(results);
 			loopScopedResults[dryItemVar] = { id: dryItemVar, json: { _placeholder: true } };
 			loopScopedResults[dryIndexVar] = { id: dryIndexVar, json: 0 };
 			for (let subIdx = 0; subIdx < step.steps.length; subIdx++) {
@@ -2448,7 +2460,7 @@ function mergeEnv(
 	args: Record<string, unknown>,
 	results: Record<string, WorkflowStepResult>,
 ) {
-	const env = { ...base } as Record<string, string | undefined>;
+	const env = createRecord(base);
 
 	// Expose resolved args as env vars so shell commands can safely reference them
 	// without embedding raw values into the command string.
@@ -2480,7 +2492,12 @@ function normalizeArgEnvKey(key: string): string | null {
 	if (!trimmed) return null;
 	// Keep it predictable for shells: uppercase and [A-Z0-9_]
 	const up = trimmed.toUpperCase();
-	const normalized = up.replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+	let normalized = up.replace(/[^A-Z0-9]+/g, "_");
+	let start = 0;
+	while (normalized[start] === "_") start++;
+	let end = normalized.length;
+	while (end > start && normalized[end - 1] === "_") end--;
+	normalized = normalized.slice(start, end);
 	return normalized || null;
 }
 
@@ -2526,8 +2543,8 @@ function resolveWorkflowStepArgs(
 	parentArgs: Record<string, unknown>,
 	results: Record<string, WorkflowStepResult>,
 ): Record<string, unknown> {
-	if (!workflowArgs) return {};
-	const resolved: Record<string, unknown> = {};
+	if (!workflowArgs) return createRecord();
+	const resolved = createRecord<unknown>();
 	for (const [key, value] of Object.entries(workflowArgs)) {
 		if (typeof value === "string") {
 			resolved[key] = resolveTemplate(value, parentArgs, results);
@@ -2540,7 +2557,7 @@ function resolveWorkflowStepArgs(
 
 function resolveArgsTemplate(input: string, args: Record<string, unknown>) {
 	return input.replace(/\$\{([A-Za-z0-9_-]+)\}/g, (match, key) => {
-		if (key in args) return String(args[key]);
+		if (Object.hasOwn(args, key)) return String(args[key]);
 		return match;
 	});
 }
@@ -3031,7 +3048,7 @@ function toOutputItems(result: WorkflowStepResult | undefined) {
 }
 
 function cloneResults(results: Record<string, WorkflowStepResult>) {
-	const out: Record<string, WorkflowStepResult> = {};
+	const out = createRecord<WorkflowStepResult>();
 	for (const [key, value] of Object.entries(results)) {
 		out[key] = { ...value };
 	}
