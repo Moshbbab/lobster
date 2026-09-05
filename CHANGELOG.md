@@ -2,19 +2,19 @@
 
 All notable changes to Lobster will be documented in this file.
 
-## Unreleased
+## 2026.9.5
 
 **Highlights:** Run configured OpenClaw agents directly from workflows, stop cancelled work before further side effects, and track LLM spend without charging cached answers again.
 
 - Add first-class `openclaw.agent` workflow turns with configured agent, session, model, thinking, and timeout selection delegated to OpenClaw. Thanks to [@Stoff81](https://github.com/Stoff81) (Issue [#117](https://github.com/openclaw/lobster/issues/117)).
-- Add opt-in process output limits with `LOBSTER_MAX_OUTPUT_BYTES`, preserving unlimited capture by default and terminating isolated process groups on overflow while forwarding terminal interrupts. Thanks @SebTardif (PR [#150](https://github.com/openclaw/lobster/pull/150)).
-- Add opt-in HTTP response limits with `LOBSTER_MAX_HTTP_RESPONSE_BYTES` across tool and built-in LLM adapters, preserving unlimited responses by default and preventing replay of dispatched tools after overflow. Thanks @SebTardif (PR [#151](https://github.com/openclaw/lobster/pull/151)).
 - Prevent automatic workflow retries after dispatching `openclaw.invoke`, `clawd.invoke`, or `openclaw.agent`, avoiding duplicate remote actions after timeouts or failures, including requests carrying the gateway's currently ignored `dryRun` flag. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#153](https://github.com/openclaw/lobster/pull/153)).
 - Stop cancelled CLI, tool-runtime, and SDK workflows before later commands or side effects; interrupt prompts and stalled streams, terminate child process trees, and prevent replay of approval/input resumes after an effect starts. Thanks to [@zhangguiping-xydt](https://github.com/zhangguiping-xydt) (PR [#119](https://github.com/openclaw/lobster/pull/119)).
 - Honor SDK cancellation in `exec()` and shell commands, including constructor signals on run, clone, and resume. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#144](https://github.com/openclaw/lobster/pull/144)).
 - Honor cancellation in `ghPrView()` and both exported GitHub monitor recipes, stopping the GitHub CLI before returning an error without saving a cancelled snapshot. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#145](https://github.com/openclaw/lobster/pull/145)).
 - Cancel timed-out `gog.gmail.send` process trees and suppress automatic retries after dispatch because termination cannot prove Gmail did not accept the message. Thanks to [@SebTardif](https://github.com/SebTardif) (PR [#136](https://github.com/openclaw/lobster/pull/136)).
 - Honor LLM step timeouts and cancellation across adapter calls, cached results, and persistence; stop waiting even when a host adapter ignores its abort signal. Thanks to [@Yigtwxx](https://github.com/Yigtwxx) (PR [#132](https://github.com/openclaw/lobster/pull/132)).
+- Add opt-in process output limits with `LOBSTER_MAX_OUTPUT_BYTES`, preserving unlimited capture by default and terminating isolated process groups on overflow while forwarding terminal interrupts. Thanks @SebTardif (PR [#150](https://github.com/openclaw/lobster/pull/150)).
+- Add opt-in HTTP response limits with `LOBSTER_MAX_HTTP_RESPONSE_BYTES` across tool and built-in LLM adapters, preserving unlimited responses by default and preventing replay of dispatched tools after overflow. Thanks @SebTardif (PR [#151](https://github.com/openclaw/lobster/pull/151)).
 - Count each model call once across cached answers, pipeline projections, sub-workflows, and resumes; preserve accumulated spend across approval/input pauses so `cost_limit` covers the whole run. Thanks to [@Yigtwxx](https://github.com/Yigtwxx) (PR [#134](https://github.com/openclaw/lobster/pull/134)).
 - Include temperature and maximum output tokens in LLM cache identity so changing generation settings does not return stale answers. Thanks to [@Yigtwxx](https://github.com/Yigtwxx) (PR [#130](https://github.com/openclaw/lobster/pull/130)).
 - Enforce `--max-validation-retries` as the number of extra model calls after the first, avoiding an additional billed call on schema failures. Thanks to [@Yigtwxx](https://github.com/Yigtwxx) (PR [#128](https://github.com/openclaw/lobster/pull/128)).
