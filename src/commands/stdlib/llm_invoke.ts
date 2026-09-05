@@ -17,6 +17,7 @@ import {
 } from "../../state/store.js";
 import { createCompileCached } from "../../validation.js";
 import type { LobsterCommand } from "../types.js";
+import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../read_response_text.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 const compileCachedLocal = createCompileCached(ajv);
@@ -1074,6 +1075,7 @@ function resolveAdapter({
 		};
 	}
 
+	const maxResponseBytes = httpResponseLimitFromEnv(env);
 	if (provider === "openclaw") {
 		const openclawUrl = String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? "").trim();
 		if (!openclawUrl) {
@@ -1085,7 +1087,7 @@ function resolveAdapter({
 			provider,
 			source: config.sourceForProvider?.(provider) ?? "openclaw",
 			async invoke({ payload, signal }) {
-				return invokeOpenClawAdapter({ endpoint, token, payload, signal });
+				return invokeOpenClawAdapter({ endpoint, token, payload, signal, maxResponseBytes });
 			},
 		};
 	}
@@ -1102,6 +1104,7 @@ function resolveAdapter({
 			async invoke({ payload, signal }) {
 				return invokeHttpAdapter({
 					endpoint: buildAdapterEndpoint(adapterUrl),
+					maxResponseBytes,
 					token,
 					payload,
 					signal,
@@ -1121,6 +1124,7 @@ function resolveAdapter({
 		async invoke({ payload, signal }) {
 			return invokeHttpAdapter({
 				endpoint: buildAdapterEndpoint(adapterUrl),
+				maxResponseBytes,
 				token,
 				payload,
 				signal,
@@ -1153,11 +1157,13 @@ async function invokeOpenClawAdapter({
 	token,
 	payload,
 	signal,
+	maxResponseBytes,
 }: {
 	endpoint: URL;
 	token: string;
 	payload: any;
 	signal?: AbortSignal;
+	maxResponseBytes?: number;
 }) {
 	const res = await fetch(endpoint, {
 		method: "POST",
@@ -1173,7 +1179,7 @@ async function invokeOpenClawAdapter({
 		}),
 	});
 
-	const text = await res.text();
+	const text = await readResponseTextCapped(res, maxResponseBytes);
 	if (!res.ok) {
 		throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 400)}`);
 	}
@@ -1205,11 +1211,13 @@ async function invokeHttpAdapter({
 	token,
 	payload,
 	signal,
+	maxResponseBytes,
 }: {
 	endpoint: URL;
 	token: string;
 	payload: any;
 	signal?: AbortSignal;
+	maxResponseBytes?: number;
 }) {
 	const res = await fetch(endpoint, {
 		method: "POST",
@@ -1221,7 +1229,7 @@ async function invokeHttpAdapter({
 		body: JSON.stringify(payload),
 	});
 
-	const text = await res.text();
+	const text = await readResponseTextCapped(res, maxResponseBytes);
 	if (!res.ok) {
 		throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 400)}`);
 	}

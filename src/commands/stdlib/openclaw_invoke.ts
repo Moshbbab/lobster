@@ -1,3 +1,5 @@
+import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../read_response_text.js";
+
 function createInvokeCommand(commandName: string) {
 	return {
 		name: commandName,
@@ -88,6 +90,7 @@ function createInvokeCommand(commandName: string) {
 			const sessionKey = args.sessionKey ?? args["session-key"] ?? null;
 			const dryRun = args.dryRun ?? args["dry-run"] ?? null;
 
+			const maxResponseBytes = httpResponseLimitFromEnv(ctx.env);
 			const invokeOnce = async (argsValue: unknown) => {
 				ctx.onNonRetryableSideEffect?.();
 				const res = await fetch(endpoint, {
@@ -106,7 +109,7 @@ function createInvokeCommand(commandName: string) {
 					}),
 				});
 
-				const text = await res.text();
+				const text = await readResponseTextCapped(res, maxResponseBytes);
 				if (!res.ok) {
 					throw new Error(`${commandName} failed (${res.status}): ${text.slice(0, 400)}`);
 				}
