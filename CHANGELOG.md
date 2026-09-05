@@ -2,6 +2,8 @@
 
 All notable changes to Lobster will be documented in this file.
 
+## Unreleased
+
 ## 2026.9.5
 
 **Highlights:** Run configured OpenClaw agents directly from workflows, stop cancelled work before further side effects, and track LLM spend without charging cached answers again.
